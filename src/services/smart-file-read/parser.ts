@@ -1,10 +1,12 @@
 
 import { execFileSync } from "node:child_process";
-import { writeFileSync, mkdtempSync, rmSync, existsSync } from "node:fs";
+import { writeFileSync, mkdtempSync, mkdirSync, rmSync, existsSync, statSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { createRequire } from "node:module";
 import { logger } from "../../utils/logger.js";
+import { resolveDataDir } from "../../shared/paths.js";
+import { treeSitterBinaryName } from "./tree-sitter-bin-name.js";
 
 const _require = typeof __filename !== 'undefined'
   ? createRequire(__filename)
@@ -137,7 +139,8 @@ function resolveGrammarPath(language: string): string | null {
 const QUERIES: Record<string, string> = {
   jsts: `
 (function_declaration name: (identifier) @name) @func
-(lexical_declaration (variable_declarator name: (identifier) @name value: [(arrow_function) (function_expression)])) @const_func
+(generator_function_declaration name: (identifier) @name) @func
+(lexical_declaration (variable_declarator name: (identifier) @name value: [(arrow_function) (function_expression) (generator_function)])) @const_func
 (class_declaration name: (type_identifier) @name) @cls
 (method_definition name: (property_identifier) @name) @method
 (interface_declaration name: (type_identifier) @name) @iface
@@ -153,7 +156,8 @@ const QUERIES: Record<string, string> = {
   // unknown node type. Class names are (identifier) here, not (type_identifier).
   js: `
 (function_declaration name: (identifier) @name) @func
-(lexical_declaration (variable_declarator name: (identifier) @name value: [(arrow_function) (function_expression)])) @const_func
+(generator_function_declaration name: (identifier) @name) @func
+(lexical_declaration (variable_declarator name: (identifier) @name value: [(arrow_function) (function_expression) (generator_function)])) @const_func
 (class_declaration name: (identifier) @name) @cls
 (method_definition name: (property_identifier) @name) @method
 (import_statement) @imp
@@ -352,24 +356,116 @@ function getQueryFile(queryKey: string): string {
   return filePath;
 }
 
-let cachedBinPath: string | null = null;
-
-function getTreeSitterBin(): string {
-  if (cachedBinPath) return cachedBinPath;
+// tree-sitter-cli installs `tree-sitter.exe` on Windows, not a bare `tree-sitter`
+// (see ChromaMcpManager.resolveUvxCommand for the same platform-suffix idiom).
+// Without the `.exe` suffix the existsSync check below always misses on Windows,
+// silently falling through to a bare `tree-sitter` that may not be on PATH —
+// smart file parsing then returns empty results with no error.
+export function resolveTreeSitterBinPath(platform: NodeJS.Platform = process.platform): string {
+  const binName = treeSitterBinaryName(platform);
 
   try {
     const pkgPath = _require.resolve("tree-sitter-cli/package.json");
-    const binPath = join(dirname(pkgPath), "tree-sitter");
+    const binPath = join(dirname(pkgPath), binName);
     if (existsSync(binPath)) {
-      cachedBinPath = binPath;
       return binPath;
     }
   } catch {
     // [ANTI-PATTERN IGNORED]: tree-sitter-cli not in node_modules is expected; falls back to PATH
   }
 
-  cachedBinPath = "tree-sitter";
+  return binName;
+}
+
+let cachedBinPath: string | null = null;
+
+function getTreeSitterBin(): string {
+  if (cachedBinPath) return cachedBinPath;
+  cachedBinPath = resolveTreeSitterBinPath();
   return cachedBinPath;
+}
+
+// `tree-sitter query -p <grammar-dir>` implies --rebuild (#3926): the CLI
+// recompiles the grammar from source on EVERY invocation, so each smart_outline
+// / smart_search / smart_unfold call paid a full C compile before it could match
+// a single node. Building the grammar once and passing the artifact with
+// `-l <lib> --lang-name <language>` turns the same call into a library load.
+// Grammar libraries live in the data dir, not in node_modules: a plugin update
+// replaces node_modules wholesale, and writing into a package directory that the
+// installer owns is not ours to do.
+const GRAMMAR_LIB_DIR = join(resolveDataDir(), "tree-sitter-libs");
+
+// dlopen does not care about the suffix, but the platform-native one keeps the
+// directory readable and matches what `tree-sitter build` emits elsewhere.
+const GRAMMAR_LIB_EXTENSION = process.platform === "win32"
+  ? ".dll"
+  : process.platform === "darwin" ? ".dylib" : ".so";
+
+// A grammar is `src/parser.c` plus an optional external scanner. Both are
+// generated artifacts shipped in the npm package, so their mtimes are the
+// cheapest available proxy for "this grammar changed".
+const GRAMMAR_SOURCE_FILES = ["parser.c", "scanner.c", "scanner.cc"];
+
+// Languages whose artifact could not be built or would not bind. Falling back to
+// `-p` per call is correct but slow, so the decision is remembered rather than
+// re-derived for every file batch.
+const grammarLibOptOut = new Set<string>();
+
+/** @internal — test-only: clear the build opt-out set so a prior failure does
+ *  not permanently poison subsequent test cases running in the same process. */
+export function _resetGrammarLibOptOut(): void {
+  grammarLibOptOut.clear();
+}
+
+function newestGrammarSourceMtime(grammarPath: string): number {
+  let newest = 0;
+  for (const file of GRAMMAR_SOURCE_FILES) {
+    try {
+      const stats = statSync(join(grammarPath, "src", file));
+      if (stats.mtimeMs > newest) newest = stats.mtimeMs;
+    } catch {
+      // [ANTI-PATTERN IGNORED]: an absent scanner is the normal case for most
+      // grammars; only parser.c is guaranteed to exist.
+    }
+  }
+  return newest;
+}
+
+/**
+ * Compile `grammarPath` into a reusable dynamic library, or return null when the
+ * caller should stay on the `--grammar-path` path.
+ *
+ * A library older than the grammar sources is rebuilt: a plugin update ships new
+ * grammar packages, and silently querying with the previous grammar would return
+ * wrong symbols instead of an error.
+ */
+function ensureGrammarLib(language: string, grammarPath: string): string | null {
+  if (grammarLibOptOut.has(language)) return null;
+
+  const libPath = join(GRAMMAR_LIB_DIR, `${language}${GRAMMAR_LIB_EXTENSION}`);
+
+  try {
+    // Deliberately re-stated per call instead of memoized: four stats cost
+    // nothing next to the process spawn they guard, and a memo would pin a
+    // long-lived MCP server to the grammar that was current at boot.
+    const needsBuild = !existsSync(libPath)
+      || statSync(libPath).mtimeMs < newestGrammarSourceMtime(grammarPath);
+
+    if (needsBuild) {
+      mkdirSync(GRAMMAR_LIB_DIR, { recursive: true });
+      execFileSync(getTreeSitterBin(), ["build", "-o", libPath, grammarPath], {
+        encoding: "utf-8",
+        timeout: 120000,
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+    }
+
+    return libPath;
+  } catch (error) {
+    logger.debug('WORKER', `tree-sitter build failed for ${language}; falling back to --grammar-path`, undefined, error instanceof Error ? error : undefined);
+    grammarLibOptOut.add(language);
+    return null;
+  }
 }
 
 interface RawCapture {
@@ -386,26 +482,36 @@ interface RawMatch {
   captures: RawCapture[];
 }
 
-function runQuery(queryFile: string, sourceFile: string, grammarPath: string): RawMatch[] {
-  const result = runBatchQuery(queryFile, [sourceFile], grammarPath);
+function runQuery(queryFile: string, sourceFile: string, grammarPath: string, language: string): RawMatch[] {
+  const result = runBatchQuery(queryFile, [sourceFile], grammarPath, language);
   return result.get(sourceFile) || [];
 }
 
-function runBatchQuery(queryFile: string, sourceFiles: string[], grammarPath: string): Map<string, RawMatch[]> {
+function execQuery(execArgs: string[], sourceFileCount: number): string | null {
+  try {
+    return execFileSync(getTreeSitterBin(), execArgs, { encoding: "utf-8", timeout: 30000, stdio: ["pipe", "pipe", "pipe"] });
+  } catch (error) {
+    logger.debug('WORKER', `tree-sitter query failed for ${sourceFileCount} file(s)`, undefined, error instanceof Error ? error : undefined);
+    return null;
+  }
+}
+
+function runBatchQuery(queryFile: string, sourceFiles: string[], grammarPath: string, language: string): Map<string, RawMatch[]> {
   if (sourceFiles.length === 0) return new Map();
 
-  const bin = getTreeSitterBin();
-  const execArgs = ["query", "-p", grammarPath, queryFile, ...sourceFiles];
+  const libPath = ensureGrammarLib(language, grammarPath);
+  if (libPath) {
+    const output = execQuery(["query", "-l", libPath, "--lang-name", language, queryFile, ...sourceFiles], sourceFiles.length);
+    if (output !== null) return parseMultiFileQueryOutput(output);
 
-  let output: string;
-  try {
-    output = execFileSync(bin, execArgs, { encoding: "utf-8", timeout: 30000, stdio: ["pipe", "pipe", "pipe"] });
-  } catch (error) {
-    logger.debug('WORKER', `tree-sitter query failed for ${sourceFiles.length} file(s)`, undefined, error instanceof Error ? error : undefined);
-    return new Map();
+    // The artifact exists but will not bind — a grammar whose language function
+    // is not named after our language key would fail here on every call. Drop
+    // back to --grammar-path permanently rather than paying two spawns per batch.
+    grammarLibOptOut.add(language);
   }
 
-  return parseMultiFileQueryOutput(output);
+  const output = execQuery(["query", "-p", grammarPath, queryFile, ...sourceFiles], sourceFiles.length);
+  return output === null ? new Map() : parseMultiFileQueryOutput(output);
 }
 
 function parseMultiFileQueryOutput(output: string): Map<string, RawMatch[]> {
@@ -545,7 +651,8 @@ function buildSymbols(matches: RawMatch[], lines: string[], language: string): {
   const symbols: CodeSymbol[] = [];
   const imports: string[] = [];
   const exportRanges: Array<{ startRow: number; endRow: number }> = [];
-  const containers: Array<{ sym: CodeSymbol; startRow: number; endRow: number }> = [];
+  const ranges = new Map<CodeSymbol, RawCapture>();
+  const containers: Array<{ sym: CodeSymbol; range: RawCapture }> = [];
 
   for (const match of matches) {
     for (const cap of match.captures) {
@@ -553,7 +660,22 @@ function buildSymbols(matches: RawMatch[], lines: string[], language: string): {
         exportRanges.push({ startRow: cap.startRow, endRow: cap.endRow });
       }
       if (cap.tag === "imp") {
-        imports.push(cap.text || lines[cap.startRow]?.trim() || "");
+        const capturedLines = lines.slice(cap.startRow, cap.endRow + 1);
+        // Tree-sitter columns are UTF-8 byte offsets, not JS string indices.
+        // A multiline capture is not repeated as `text` in CLI query output.
+        capturedLines[0] = Buffer.from(capturedLines[0] ?? "").subarray(cap.startCol).toString();
+        const last = capturedLines.length - 1;
+        const endCol = cap.endCol - (last === 0 ? cap.startCol : 0);
+        capturedLines[last] = Buffer.from(capturedLines[last]).subarray(0, endCol).toString();
+        // Outlines go straight into an agent's context, so each entry is one
+        // line capped at the 200-char signature budget: a Go `import ( … )`
+        // group, a Ruby call with a `do … end` block or an SCSS `@include { … }`
+        // is one capture that can span a whole file. Keep both ends, because an
+        // import's module source comes last.
+        const importText = capturedLines.map(line => line.trim()).filter(Boolean).join(" ");
+        imports.push(importText.length > 200
+          ? `${importText.slice(0, 140)} … ${importText.slice(-55)}`
+          : importText);
       }
     }
   }
@@ -600,9 +722,10 @@ function buildSymbols(matches: RawMatch[], lines: string[], language: string): {
 
     if (CONTAINER_KINDS.has(kind)) {
       sym.children = [];
-      containers.push({ sym, startRow, endRow });
+      containers.push({ sym, range: kindCapture });
     }
 
+    ranges.set(sym, kindCapture);
     symbols.push(sym);
   }
 
@@ -631,15 +754,24 @@ function buildSymbols(matches: RawMatch[], lines: string[], language: string): {
     }
   }
 
+  // Tree-sitter ranges include columns: row-only comparisons lose methods
+  // on the opening line and cannot distinguish adjacent one-line declarations.
+  // The latest containing start is the nearest lexical container, so a nested
+  // class's method is attached once instead of also appearing on every ancestor.
+  containers.sort((a, b) => b.range.startRow - a.range.startRow
+    || b.range.startCol - a.range.startCol);
   const nested = new Set<CodeSymbol>();
-  for (const container of containers) {
-    for (const sym of symbols) {
-      if (sym === container.sym) continue;
-      if (sym.lineStart > container.startRow && sym.lineEnd <= container.endRow) {
-        if (sym.kind === "function") sym.kind = "method";
-        container.sym.children!.push(sym);
-        nested.add(sym);
-      }
+  for (const sym of symbols) {
+    const range = ranges.get(sym)!;
+    const owner = containers.find(({ sym: candidate, range: parent }) => candidate !== sym
+      && (range.startRow > parent.startRow
+        || (range.startRow === parent.startRow && range.startCol >= parent.startCol))
+      && (range.endRow < parent.endRow
+        || (range.endRow === parent.endRow && range.endCol <= parent.endCol)));
+    if (owner) {
+      if (sym.kind === "function") sym.kind = "method";
+      owner.sym.children!.push(sym);
+      nested.add(sym);
     }
   }
 
@@ -666,7 +798,7 @@ export function parseFile(content: string, filePath: string): FoldedFile {
   writeFileSync(tmpFile, content);
 
   try {
-    const matches = runQuery(queryFile, tmpFile, grammarPath);
+    const matches = runQuery(queryFile, tmpFile, grammarPath, language);
     const result = buildSymbols(matches, lines, language);
 
     const folded = formatFoldedView({
@@ -714,7 +846,7 @@ export function parseFilesBatch(
     const queryFile = getQueryFile(getQueryKey(language));
 
     const absolutePaths = groupFiles.map(f => f.absolutePath);
-    const batchResults = runBatchQuery(queryFile, absolutePaths, grammarPath);
+    const batchResults = runBatchQuery(queryFile, absolutePaths, grammarPath, language);
 
     for (const file of groupFiles) {
       const lines = file.content.split("\n");
